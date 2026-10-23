@@ -1,154 +1,166 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
 from collections import defaultdict
+from itertools import combinations
 
-st.set_page_config(page_title="AI EPL Simulator", page_icon="⚽")
+st.set_page_config(page_title="AI EPL Season Simulator", page_icon="⚽", layout="wide")
 st.title("⚽ AI Premier League Season Simulator")
-st.write("Train AI on 5 previous seasons and simulate 100 possible seasons.")
+st.write("Train a machine-learning model on five previous EPL seasons and simulate 100 possible seasons.")
 
 SEASONS = {
     "2021/22": "2122",
     "2022/23": "2223",
     "2023/24": "2324",
     "2024/25": "2425",
-    "2025/26": "2526"
+    "2025/26": "2526",
 }
 
-@st.cache_data
+@st.cache_data(show_spinner="Downloading historical EPL results...")
 def load_data():
     frames = []
     for season, code in SEASONS.items():
         url = f"https://www.football-data.co.uk/mmz4281/{code}/E0.csv"
         df = pd.read_csv(url)
         df.columns = df.columns.str.strip()
-        needed = ["HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]
-        df = df.dropna(subset=needed)
+        required = ["HomeTeam", "AwayTeam", "FTHG", "FTAG", "FTR"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"{season} CSV is missing columns: {', '.join(missing)}")
+        df = df[required].copy()
         df["Season"] = season
-        frames.append(df[needed + ["Season"]])
-
+        df["FTHG"] = pd.to_numeric(df["FTHG"], errors="coerce")
+        df["FTAG"] = pd.to_numeric(df["FTAG"], errors="coerce")
+        df = df.dropna(subset=required)
+        df = df[df["FTR"].isin(["H", "D", "A"])]
+        frames.append(df)
     return pd.concat(frames, ignore_index=True)
 
 try:
     data = load_data()
 except Exception as e:
-    st.error("Could not download the football data. Check your internet connection and try again.")
-    st.caption(str(e))
+    st.error("Couldn't download the historical data. Check the app's internet connection and try again.")
+    st.caption(f"Technical detail: {e}")
     st.stop()
 
-data["FTHG"] = pd.to_numeric(data["FTHG"], errors="coerce")
-data["FTAG"] = pd.to_numeric(data["FTAG"], errors="coerce")
-data = data.dropna(subset=["FTHG", "FTAG", "FTR"])
-data = data[data["FTR"].isin(["H", "D", "A"])]
+data["FTHG"] = data["FTHG"].astype(int)
+data["FTAG"] = data["FTAG"].astype(int)
+data = data.sort_values(["Season"]).reset_index(drop=True)
 
-# Build historical form features using only earlier matches
-stats = defaultdict(lambda: [0, 0, 0])  # goals for, against, matches
-features = []
-labels = []
+# Build form features before each match, so the model never sees that match's result.
+team_stats = defaultdict(lambda: {"gf": 0, "ga": 0, "matches": 0})
+X_rows, y_rows = [], []
 
-for _, row in data.iterrows():
-    home = row["HomeTeam"]
-    away = row["AwayTeam"]
+for _, match in data.iterrows():
+    home, away = match["HomeTeam"], match["AwayTeam"]
+    hs, aws = team_stats[home], team_stats[away]
 
-    h = stats[home]
-    a = stats[away]
+    def averages(s):
+        if s["matches"] == 0:
+            return 1.4, 1.4
+        return s["gf"] / s["matches"], s["ga"] / s["matches"]
 
-    features.append([
-        h[0] / h[2] if h[2] else 1.4,
-        h[1] / h[2] if h[2] else 1.4,
-        a[0] / a[2] if a[2] else 1.4,
-        a[1] / a[2] if a[2] else 1.4
-    ])
-    labels.append(row["FTR"])
+    hgf, hga = averages(hs)
+    agf, aga = averages(aws)
+    X_rows.append([hgf, hga, agf, aga])
+    y_rows.append(match["FTR"])
 
-    hg, ag = int(row["FTHG"]), int(row["FTAG"])
-    stats[home] = [h[0] + hg, h[1] + ag, h[2] + 1]
-    stats[away] = [a[0] + ag, a[1] + hg, a[2] + 1]
+    hg, ag = int(match["FTHG"]), int(match["FTAG"])
+    hs["gf"] += hg
+    hs["ga"] += ag
+    hs["matches"] += 1
+    aws["gf"] += ag
+    aws["ga"] += hg
+    aws["matches"] += 1
 
-X = pd.DataFrame(features, columns=["HomeGF", "HomeGA", "AwayGF", "AwayGA"])
-y = labels
+X = pd.DataFrame(X_rows, columns=["HomeGF", "HomeGA", "AwayGF", "AwayGA"])
+y = pd.Series(y_rows)
 
-model = DecisionTreeClassifier(max_depth=5, random_state=42)
+model = RandomForestClassifier(n_estimators=100, max_depth=7, random_state=42,
+                               class_weight="balanced")
 model.fit(X, y)
 
-st.success(f"AI trained using {len(data)} real historical matches.")
+st.success(f"AI trained on {len(data):,} real historical matches from {len(SEASONS)} seasons.")
+st.caption("Source: Football-Data.co.uk. Historical results are used to learn outcome patterns.")
 
-# Teams from the latest completed season in the dataset
-latest = data[data["Season"] == "2025/26"]
+# The latest season in the chosen data provides the league's team list.
+latest_season = "2025/26"
+latest = data[data["Season"] == latest_season].copy()
 teams = sorted(set(latest["HomeTeam"]) | set(latest["AwayTeam"]))
 
 if len(teams) < 2:
-    st.error("Not enough teams found in the latest season.")
+    st.error("Not enough teams were found in the latest season.")
     st.stop()
 
-st.subheader("League settings")
-simulations = st.number_input(
-    "Number of seasons to simulate",
-    min_value=10, max_value=1000, value=100, step=10
-)
+left, right = st.columns(2)
+with left:
+    simulations = st.number_input("Seasons to simulate", min_value=10, max_value=1000,
+                                  value=100, step=10)
+with right:
+    st.metric("Teams", len(teams))
+    st.metric("Matches per season", len(teams) * (len(teams) - 1))
 
-st.write(f"Teams: {len(teams)}")
-st.write(f"Matches per simulated season: {len(teams) * (len(teams) - 1)}")
+# Start simulated seasons with each team's actual record from the latest season.
+def initial_form():
+    form = defaultdict(lambda: {"gf": 0, "ga": 0, "matches": 0})
+    for _, m in latest.iterrows():
+        home, away = m["HomeTeam"], m["AwayTeam"]
+        hg, ag = int(m["FTHG"]), int(m["FTAG"])
+        form[home]["gf"] += hg
+        form[home]["ga"] += ag
+        form[home]["matches"] += 1
+        form[away]["gf"] += ag
+        form[away]["ga"] += hg
+        form[away]["matches"] += 1
+    return form
 
-# Historical scorelines used to create realistic simulated scores
-score_data = data[["FTR", "FTHG", "FTAG"]].copy()
-score_data["FTHG"] = score_data["FTHG"].astype(int)
-score_data["FTAG"] = score_data["FTAG"].astype(int)
+def team_averages(s):
+    if s["matches"] == 0:
+        return 1.4, 1.4
+    return s["gf"] / s["matches"], s["ga"] / s["matches"]
 
-# Start each simulation with latest-season team form
-def starting_stats():
-    result = defaultdict(lambda: [0, 0, 0])
-    for _, row in latest.iterrows():
-        home, away = row["HomeTeam"], row["AwayTeam"]
-        hg, ag = int(row["FTHG"]), int(row["FTAG"])
-        result[home][0] += hg
-        result[home][1] += ag
-        result[home][2] += 1
-        result[away][0] += ag
-        result[away][1] += hg
-        result[away][2] += 1
-    return result
+# Real historical scorelines are sampled after the AI predicts win/draw/loss.
+scorelines = {
+    outcome: data.loc[data["FTR"] == outcome, ["FTHG", "FTAG"]].to_numpy()
+    for outcome in ["H", "D", "A"]
+}
 
-def simulate_season():
-    form = starting_stats()
+def simulate_season(seed):
+    rng = np.random.default_rng(seed)
+    form = initial_form()
     table = {
         t: {"Played": 0, "Won": 0, "Drawn": 0, "Lost": 0,
             "GF": 0, "GA": 0, "Points": 0}
         for t in teams
     }
 
-    fixtures = []
-    for i in range(len(teams)):
-        for j in range(i + 1, len(teams)):
-            fixtures.append((teams[i], teams[j]))
-            fixtures.append((teams[j], teams[i]))
-
-    np.random.shuffle(fixtures)
+    # Every pair plays twice: once at each team's home ground.
+    fixtures = [(h, a) for h, a in combinations(teams, 2)]
+    fixtures += [(a, h) for h, a in combinations(teams, 2)]
+    rng.shuffle(fixtures)
+    played = []
 
     for home, away in fixtures:
-        h, a = form[home], form[away]
-        row = [[
-            h[0] / h[2] if h[2] else 1.4,
-            h[1] / h[2] if h[2] else 1.4,
-            a[0] / a[2] if a[2] else 1.4,
-            a[1] / a[2] if a[2] else 1.4
-        ]]
+        hgf, hga = team_averages(form[home])
+        agf, aga = team_averages(form[away])
+        row = pd.DataFrame([[hgf, hga, agf, aga]], columns=X.columns)
 
         probabilities = model.predict_proba(row)[0]
-        outcome = np.random.choice(model.classes_, p=probabilities)
+        outcome = rng.choice(model.classes_, p=probabilities)
+        scores = scorelines[outcome]
+        hg, ag = scores[rng.integers(0, len(scores))]
+        hg, ag = int(hg), int(ag)
 
-        # Pick a real historical score with the predicted outcome
-        possible = score_data[score_data["FTR"] == outcome]
-        score = possible.sample(1).iloc[0]
-        hg, ag = int(score["FTHG"]), int(score["FTAG"])
+        played.append({"Home Team": home, "Home Goals": hg,
+                       "Away Goals": ag, "Away Team": away})
 
-        # Update league table
-        for team, gf, ga in [(home, hg, ag), (away, ag, hg)]:
-            table[team]["Played"] += 1
-            table[team]["GF"] += gf
-            table[team]["GA"] += ga
+        table[home]["Played"] += 1
+        table[away]["Played"] += 1
+        table[home]["GF"] += hg
+        table[home]["GA"] += ag
+        table[away]["GF"] += ag
+        table[away]["GA"] += hg
 
         if hg > ag:
             table[home]["Won"] += 1
@@ -164,56 +176,59 @@ def simulate_season():
             table[home]["Points"] += 1
             table[away]["Points"] += 1
 
-        # Update team form with simulated result
-        form[home] = [h[0] + hg, h[1] + ag, h[2] + 1]
-        form[away] = [a[0] + ag, a[1] + hg, a[2] + 1]
+        # Update form only after predicting and generating this match.
+        form[home]["gf"] += hg
+        form[home]["ga"] += ag
+        form[home]["matches"] += 1
+        form[away]["gf"] += ag
+        form[away]["ga"] += hg
+        form[away]["matches"] += 1
 
     result = pd.DataFrame.from_dict(table, orient="index")
     result.index.name = "Team"
     result["GD"] = result["GF"] - result["GA"]
-    return result.sort_values(
-        ["Points", "GD", "GF"], ascending=False
-    )
+    result = result.sort_values(["Points", "GD", "GF"], ascending=False).reset_index()
+    result.insert(0, "Position", range(1, len(result) + 1))
+    return result, pd.DataFrame(played)
 
-if st.button("🚀 Simulate League Season"):
+if st.button("🚀 Simulate league season", type="primary"):
     title_counts = dict.fromkeys(teams, 0)
-    example_table = None
-
+    example_table, example_fixtures = None, None
     progress = st.progress(0, text="Simulating seasons...")
 
     for i in range(int(simulations)):
-        result = simulate_season()
-        title_counts[result.index[0]] += 1
+        table, fixtures = simulate_season(seed=1000 + i)
+        title_counts[table.iloc[0]["Team"]] += 1
         if i == 0:
-            example_table = result.reset_index()
-        progress.progress((i + 1) / simulations)
+            example_table = table
+            example_fixtures = fixtures
+        progress.progress((i + 1) / int(simulations), text=f"Simulating season {i + 1}/{int(simulations)}")
 
-    st.subheader("🏆 Most likely champion")
     chances = pd.DataFrame({
         "Team": list(title_counts.keys()),
-        "Title Chance (%)": [
-            round(v / simulations * 100, 1)
-            for v in title_counts.values()
-        ]
-    }).sort_values("Title Chance (%)", ascending=False)
+        "Titles Won": list(title_counts.values()),
+    })
+    chances["Title Chance (%)"] = (chances["Titles Won"] / int(simulations) * 100).round(1)
+    chances = chances.sort_values(["Title Chance (%)", "Titles Won"], ascending=False).reset_index(drop=True)
 
+    st.subheader("🏆 Predicted champion")
     winner = chances.iloc[0]
-    st.success(
-        f"Predicted champion: {winner['Team']} "
-        f"({winner['Title Chance (%)']}% of simulations)"
-    )
+    st.success(f"{winner['Team']} — {winner['Title Chance (%)']}% title chance in these simulations")
+    st.caption("This is a simulation estimate, not a guarantee about the real season.")
 
     st.subheader("Title-winning probabilities")
     st.bar_chart(chances.set_index("Team")["Title Chance (%)"])
     st.dataframe(chances, hide_index=True, use_container_width=True)
 
     st.subheader("Example simulated league table")
-    example_table.insert(0, "Position", range(1, len(example_table) + 1))
     st.dataframe(example_table, hide_index=True, use_container_width=True)
 
-    st.caption(
-        "This is an educational simulation, not a guaranteed prediction. "
-        "It uses historical match results and simulated outcomes."
-    )
+    st.subheader("Example simulated fixtures and results")
+    st.dataframe(example_fixtures, hide_index=True, use_container_width=True)
 
-st.caption("Historical data source: football-data.co.uk")
+    csv = example_fixtures.to_csv(index=False).encode("utf-8")
+    st.download_button("Download simulated fixtures as CSV", csv,
+                       "simulated_epl_fixtures.csv", "text/csv")
+
+st.divider()
+st.caption("Educational Class 12 project | Python, Streamlit, pandas, NumPy and scikit-learn")
